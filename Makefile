@@ -11,7 +11,7 @@ endif
 CFLAGS = -Wall -ansi -pedantic $(FLAGS_OPTS)
 INCLUDES = -I/usr/local/include
 LFLAGS = -Wall -L/usr/local/lib $(FLAGS_OPTS)
-LIBS = -levent_core
+LIBS = -levent_core -levent_extra
 
 SRCS = main.c \
 	   util.c \

@@ -40,11 +40,36 @@
 enum socks5_conn_status {
 	SCONN_INIT = 0,
 	SCONN_CLIENT_MUST_CLOSE,
-	SCONN_AUTHORIZED
+	SCONN_AUTHORIZED,
+	SCONN_CONNECT_WAIT,
+	SCONN_CONNECT_TRANSMITTING
 };
 
 #define SOCKS5_AUTH_NONE			(0x00)
 #define SOCKS5_AUTH_UNACCEPTABLE	(0xFF)
+
+#define SOCKS5_CMD_CONNECT		(0x01)
+#define SOCKS5_CMD_BIND			(0x02)
+#define SOCKS5_CMD_UDP_ASSOC	(0x03)
+#define SOCKS5_CMD_VALID(cmd) \
+	(((cmd) > 0x00) && ((cmd) < 0x04))
+
+#define SOCKS5_ATYPE_IPV4	(0x01)
+#define SOCKS5_ATYPE_DOMAIN	(0x03)
+#define SOCKS5_ATYPE_IPV6	(0x04)
+#define SOCKS5_ATYPE_VALID(cmd) \
+	(((cmd) > 0x00) && ((cmd) < 0x05) && ((cmd) != 0x02))
+
+#define SOCKS5_REP_SUCCEEDED			(0x00)
+#define SOCKS5_REP_GENERAL_FAILURE		(0x01)
+#define SOCKS5_REP_NOT_ALLOWED			(0x02)
+#define SOCKS5_REP_NET_UNREACHABLE		(0x03)
+#define SOCKS5_REP_HOST_UNREACHABLE		(0x04)
+#define SOCKS5_REP_CONN_REFUSED			(0x05)
+#define SOCKS5_REP_TTL_EXPIRED			(0x06)
+#define SOCKS5_REP_BAD_COMMAND			(0x07)
+#define SOCKS5_REP_ATYPE_UNSUPPORTED	(0x08)
+
 /*
  * socks5_conn
  */
@@ -53,6 +78,7 @@ struct socks5_conn {
 	struct bufferevent *dst;
 	enum socks5_conn_status status;
 	unsigned char auth_method;
+	unsigned char command;
 };
 
 /*

@@ -36,20 +36,27 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netdb.h>
+#include <arpa/inet.h>
 #include <event2/event.h>
 #include <event2/buffer.h>
 #include <event2/bufferevent.h>
+#include <event2/dns.h>
 #include "util.h"
 #include "oddsock.h"
 #include "socks5.h"
 
 #define LISTEN_BACKLOG (128)
 
+struct evdns_base *g_dns_base = NULL;
+
+int socks5_conn_id(struct socks5_conn *sconn);
 void socks5_conn_free(struct socks5_conn *sconn);
 
 int socks5_process_greeting(struct socks5_conn *sconn);
-unsigned char socks5_choose_auth_method(struct socks5_conn *sconn,
+void socks5_choose_auth_method(struct socks5_conn *sconn,
 		unsigned char *methods, unsigned char nmethods);
+int socks5_process_request(struct socks5_conn *sconn);
+int socks5_connect_reply(struct socks5_conn *sconn);
 void socks5_client_readcb(struct bufferevent *bev, void *arg);
 void socks5_client_eventcb(struct bufferevent *bev, short what, void *arg);
 void socks5_dst_readcb(struct bufferevent *bev, void *arg);
@@ -159,17 +166,19 @@ void socks5_listener_accept(int listener, short what, void *arg)
 	if (g_opts.verbosity > 0) {
 		sockaddr_to_presentation((struct sockaddr*)&ssaddr,
 				addr, sizeof(addr), &port);
-		oddsock_logx(1, "accepted connection from %s port %u", addr, port);
+		oddsock_logx(1, "(%d) accepted connection from %s port %u",
+				fd, addr, port);
 	}
 
 	if (make_socket_nonblocking(fd) < 0) {
-		oddsock_logx(1, "failed setting accepted socket to nonblocking");
+		oddsock_logx(1,
+				"(%d) failed setting accepted socket to nonblocking", fd);
 		return;
 	}
 
 	sconn = (struct socks5_conn*)malloc(sizeof(struct socks5_conn));
 	if (!sconn) {
-		oddsock_logx(1, "failed allocating socks5_conn");
+		oddsock_logx(1, "(%d) failed allocating socks5_conn", fd);
 		return;
 	}
 	memset(sconn, 0, sizeof(struct socks5_conn));
@@ -178,7 +187,7 @@ void socks5_listener_accept(int listener, short what, void *arg)
 
 	sconn->client = bufferevent_socket_new(base, fd, BEV_OPT_CLOSE_ON_FREE);
 	if (!sconn->client) {
-		oddsock_logx(1, "failed creating client bufferevent");
+		oddsock_logx(1, "(%d) failed creating client bufferevent", fd);
 		socks5_conn_free(sconn);
 		return;
 	}
@@ -193,10 +202,21 @@ void socks5_listener_accept(int listener, short what, void *arg)
 	bufferevent_set_timeouts(sconn->client, &tv, NULL);
 
 	if (bufferevent_enable(sconn->client, EV_READ|EV_WRITE) != 0) {
-		oddsock_logx(1, "failed to enable read/write on client");
+		oddsock_logx(1, "(%d) failed to enable read/write on client", fd);
 		socks5_conn_free(sconn);
 		return;
 	}
+}
+
+/*
+ * socks5_conn_id
+ */
+int socks5_conn_id(struct socks5_conn *sconn)
+{
+	if (!sconn || !sconn->client)
+		return -1;
+
+	return bufferevent_getfd(sconn->client);
 }
 
 /*
@@ -205,6 +225,7 @@ void socks5_listener_accept(int listener, short what, void *arg)
 void socks5_conn_free(struct socks5_conn *sconn)
 {
 	if (sconn) {
+		oddsock_logx(1, "(%d) freeing connections", socks5_conn_id(sconn));
 		if (sconn->client)
 			bufferevent_free(sconn->client);
 		if (sconn->dst)
@@ -230,7 +251,9 @@ int socks5_process_greeting(struct socks5_conn *sconn)
 	unsigned char *methods = NULL;
 	unsigned char greeting_reply[2];
 
-	if (sconn->status != SCONN_INIT)
+	if (!sconn ||
+		sconn->status != SCONN_INIT ||
+		!sconn->client)
 		return -1;
 	
 	buffer = bufferevent_get_input(sconn->client);
@@ -262,10 +285,10 @@ int socks5_process_greeting(struct socks5_conn *sconn)
 		return -1;
 
 	evbuffer_drain(buffer, sizeof(greeting));
-	evbuffer_remove(buffer, (void*)methods, nmethods);
+	evbuffer_remove(buffer, (void*)methods, nmethods); /* XXXerr */
 
 	/* Choose which auth method to use. */
-	sconn->auth_method = socks5_choose_auth_method(sconn, methods, nmethods);
+	socks5_choose_auth_method(sconn, methods, nmethods);
 	free(methods);
 
 	/* Respond with chosen method. */
@@ -292,14 +315,11 @@ int socks5_process_greeting(struct socks5_conn *sconn)
 /*
  * socks5_choose_auth_method
  */
-unsigned char socks5_choose_auth_method(struct socks5_conn *sconn,
+void socks5_choose_auth_method(struct socks5_conn *sconn,
 		unsigned char *methods, unsigned char nmethods)
 {
 	unsigned char i;
 	unsigned char method = SOCKS5_AUTH_UNACCEPTABLE;
-
-	if (!sconn || !methods)
-		return method;
 
 	for (i = 0; i < nmethods; ++i) {
 		if (methods[i] == SOCKS5_AUTH_NONE) {
@@ -308,7 +328,230 @@ unsigned char socks5_choose_auth_method(struct socks5_conn *sconn,
 		}
 	}
 
-	return method;
+	sconn->auth_method = method;
+}
+
+/*
+ * socks5_process_request
+ */
+int socks5_process_request(struct socks5_conn *sconn)
+{
+	struct evbuffer *buffer;
+	size_t have;
+	unsigned char request[6+256]; /* fixed + variable address */
+	unsigned char request_reply[2] = { 0x05, 0x00 };
+	unsigned char atype;
+	int af;
+	char addr[256]; /* max(unsigned char) + NULL terminator */
+	unsigned short port;
+
+	if (!sconn ||
+		sconn->status != SCONN_AUTHORIZED ||
+		!sconn->client)
+		return -1;
+	
+	buffer = bufferevent_get_input(sconn->client);
+	have = evbuffer_get_length(buffer);
+
+	if (have < 1)
+		return 0;
+	evbuffer_copyout(buffer, (void*)request, 1);
+
+	/* Check version field. */
+	if (request[0] != 0x05)
+		return -1;
+
+	if (have < 8)
+		return 0;
+	evbuffer_copyout(buffer, (void*)request, 8);
+
+	/* Get command and address type. */
+	if (!SOCKS5_CMD_VALID(request[1])) {
+		request_reply[1] = SOCKS5_REP_BAD_COMMAND;
+		bufferevent_write(sconn->client, request_reply, 2);
+		return -1;
+	}
+	sconn->command = request[1];
+
+	if (!SOCKS5_ATYPE_VALID(request[3])) {
+		request_reply[1] = SOCKS5_REP_BAD_COMMAND;
+		bufferevent_write(sconn->client, request_reply, 2);
+		return -1;
+	}
+	atype = request[3];
+
+	/* Get the address and port. */
+	if (atype == SOCKS5_ATYPE_IPV4) {
+		if (have < 10)
+			return 0;
+		else if (have > 10)
+			return -1;
+
+		evbuffer_remove(buffer, (void*)request, 10);
+
+		af = AF_INET;
+		if (!inet_ntop(af, &request[4], addr, sizeof(addr))) {
+			oddsock_log(1, errno,
+					"(%d) inet_ntop failed while processing request",
+					socks5_conn_id(sconn));
+			request_reply[1] = SOCKS5_REP_GENERAL_FAILURE;
+			bufferevent_write(sconn->client, request_reply, 2);
+			return -1;
+		}
+
+		port = ntohs(*((unsigned short*)&request[8]));
+	}
+	else if (atype == SOCKS5_ATYPE_IPV6) {
+		if (have < 22)
+			return 0;
+		else if (have > 22)
+			return -1;
+
+		evbuffer_remove(buffer, (void*)request, 22);
+
+		af = AF_INET6;
+		if (!inet_ntop(af, &request[4], addr, sizeof(addr))) {
+			oddsock_log(1, errno,
+					"(%d) inet_ntop failed while processing request",
+					socks5_conn_id(sconn));
+			request_reply[1] = SOCKS5_REP_GENERAL_FAILURE;
+			bufferevent_write(sconn->client, request_reply, 2);
+			return -1;
+		}
+
+		port = ntohs(*((unsigned short*)&request[20]));
+	}
+	else if (atype == SOCKS5_ATYPE_DOMAIN) {
+		unsigned char addrlen;
+
+		addrlen = request[4];
+		if (have < (7 + addrlen))
+			return 0;
+		else if (have > (7 + addrlen))
+			return -1;
+
+		evbuffer_remove(buffer, (void*)request, (7 + addrlen));
+
+		af = AF_UNSPEC;
+		memcpy(addr, &request[5], addrlen);
+		addr[addrlen] = '\0';
+		port = ntohs(*((unsigned short*)&request[5+addrlen]));
+	}
+
+	/* Handle request. */
+	if (sconn->command == SOCKS5_CMD_CONNECT) {
+		/* CONNECT request. */
+		oddsock_logx(1, "(%d) connection request for %s port %u",
+				socks5_conn_id(sconn), addr, port);
+
+		/* Create dst bufferevent. */
+		sconn->dst = bufferevent_socket_new(
+				bufferevent_get_base(sconn->client), -1,
+				BEV_OPT_CLOSE_ON_FREE);
+		if (!sconn->dst) {
+			oddsock_log(1, errno, "(%d) failed creating dst bufferevent",
+					socks5_conn_id(sconn));
+			request_reply[1] = SOCKS5_REP_GENERAL_FAILURE;
+			bufferevent_write(sconn->client, request_reply, 2);
+			return -1;
+		}
+
+		bufferevent_setcb(sconn->dst, socks5_dst_readcb, NULL,
+				socks5_dst_eventcb, (void*)sconn);
+
+		if (bufferevent_enable(sconn->dst, EV_READ|EV_WRITE) != 0) {
+			oddsock_logx(1, "(%d) failed to enable read/write on dst",
+					socks5_conn_id(sconn));
+			request_reply[1] = SOCKS5_REP_GENERAL_FAILURE;
+			bufferevent_write(sconn->client, request_reply, 2);
+			return -1;
+		}
+
+		/* Make sure the DNS resolver is ready. */
+		if (!g_dns_base) {
+			g_dns_base = evdns_base_new(
+					bufferevent_get_base(sconn->client), 1);
+			if (!g_dns_base) {
+				oddsock_logx(0, "(%d) failed creating evdns_base",
+						socks5_conn_id(sconn));
+			}
+		}
+
+		/* Connect to destination. */
+		if (bufferevent_socket_connect_hostname(
+					sconn->dst, g_dns_base, af, addr, port) != 0) {
+			oddsock_log(1, errno, "(%d) failed creating dst bufferevent",
+					socks5_conn_id(sconn));
+			request_reply[1] = SOCKS5_REP_GENERAL_FAILURE;
+			bufferevent_write(sconn->client, request_reply, 2);
+			return -1;
+		}
+
+		sconn->status = SCONN_CONNECT_WAIT;
+	}
+	else {
+		/* Only CONNECT is implemented right now. */
+		oddsock_log(1, errno,
+				"(%d) unsupported command %u requested",
+				socks5_conn_id(sconn), sconn->command);
+		request_reply[1] = SOCKS5_REP_BAD_COMMAND;
+		bufferevent_write(sconn->client, request_reply, 2);
+		return -1;
+	}
+
+	return 1;
+}
+
+/*
+ * socks5_connect_reply
+ */
+int socks5_connect_reply(struct socks5_conn *sconn)
+{
+	unsigned char reply[5];
+	struct sockaddr_storage ssaddr;
+	socklen_t sslen = sizeof(ssaddr);
+	int dstfd;
+
+	reply[0] = 0x05;
+	dstfd = bufferevent_getfd(sconn->dst);
+
+	memset(&ssaddr, 0, sizeof(ssaddr));
+	if (getsockname(dstfd, (struct sockaddr*)&ssaddr, &sslen) < 0) {
+		/* Notify client of failure and close. */
+		reply[1] = SOCKS5_REP_GENERAL_FAILURE;
+		bufferevent_write(sconn->client, reply, 2);
+		return -1;
+	}
+
+	reply[1] = SOCKS5_REP_SUCCEEDED;
+	reply[2] = 0x00;
+
+	if (ssaddr.ss_family == AF_INET) {
+		struct sockaddr_in *saddr = (struct sockaddr_in*)&ssaddr;
+		reply[3] = SOCKS5_ATYPE_IPV4;
+		bufferevent_write(sconn->client, reply, 4); 
+		bufferevent_write(sconn->client, &saddr->sin_addr,
+				sizeof(saddr->sin_addr));
+		bufferevent_write(sconn->client, &saddr->sin_port, 2);
+	}
+	else if (ssaddr.ss_family == AF_INET6) {
+		struct sockaddr_in6 *saddr = (struct sockaddr_in6*)&ssaddr;
+		reply[3] = SOCKS5_ATYPE_IPV6;
+		bufferevent_write(sconn->client, reply, 4); 
+		bufferevent_write(sconn->client, &saddr->sin6_addr,
+				sizeof(saddr->sin6_addr));
+		bufferevent_write(sconn->client, &saddr->sin6_port, 2);
+	}
+	else {
+		/* Notify client of failure and close. */
+		reply[1] = SOCKS5_REP_GENERAL_FAILURE;
+		bufferevent_write(sconn->client, reply, 2);
+		return -1;
+	}
+
+	sconn->status = SCONN_CONNECT_TRANSMITTING;
+
+	return 0;
 }
 
 /*
@@ -327,16 +570,35 @@ void socks5_client_readcb(struct bufferevent *bev, void *arg)
 	if (sconn->status == SCONN_INIT) {
 		e = socks5_process_greeting(sconn);
 		if (e < 0) {
-			oddsock_logx(1, "error processing client greeting");
+			oddsock_logx(1, "(%d) error processing client greeting",
+					socks5_conn_id(sconn));
 			socks5_conn_free(sconn);
 		}
-	}
-	else if (sconn->status == SCONN_AUTHORIZED) {
 	}
 	else if (sconn->status == SCONN_CLIENT_MUST_CLOSE) {
 		/* The client MUST close the connection yet it is still sending
 		 * something so close the connection. */
+		oddsock_logx(1, "(%d) client not rfc1928 conformant",
+				socks5_conn_id(sconn));
 		socks5_conn_free(sconn);
+	}
+	else if (sconn->status == SCONN_AUTHORIZED) {
+		e = socks5_process_request(sconn);
+		if (e < 0) {
+			oddsock_logx(1,"(%d) error processing client request",
+					socks5_conn_id(sconn));
+			socks5_conn_free(sconn);
+		}
+	}
+	else if (sconn->status == SCONN_CONNECT_WAIT) {
+		/* Client sent data while waiting on request reply.
+		 * Treat this as an errant client and clost connection. */
+		oddsock_logx(1, "(%d) errant client", socks5_conn_id(sconn));
+		socks5_conn_free(sconn);
+	}
+	else if (sconn->status == SCONN_CONNECT_TRANSMITTING) {
+		bufferevent_read_buffer(sconn->client,
+				bufferevent_get_output(sconn->dst));
 	}
 }
 
@@ -354,11 +616,15 @@ void socks5_client_eventcb(struct bufferevent *bev, short what, void *arg)
 
 	if (what & BEV_EVENT_EOF) {
 		/* Client closed the connection. */
+		oddsock_logx(1, "(%d) client closed connection",
+				socks5_conn_id(sconn));
 		socks5_conn_free(sconn);
 		return;
 	}
 	if (what & BEV_EVENT_ERROR) {
-		oddsock_log(0, errno, "client connection error");
+		oddsock_log(1, errno, "client connection error");
+		socks5_conn_free(sconn);
+		return;
 	}
 }
 
@@ -367,6 +633,17 @@ void socks5_client_eventcb(struct bufferevent *bev, short what, void *arg)
  */
 void socks5_dst_readcb(struct bufferevent *bev, void *arg)
 {
+	struct socks5_conn *sconn = (struct socks5_conn*)arg;
+
+	if (!sconn ||
+		!sconn->client ||
+		!sconn->dst)
+		return;
+
+	if (sconn->status == SCONN_CONNECT_TRANSMITTING) {
+		bufferevent_read_buffer(sconn->dst,
+				bufferevent_get_output(sconn->client));
+	}
 }
 
 /*
@@ -374,5 +651,38 @@ void socks5_dst_readcb(struct bufferevent *bev, void *arg)
  */
 void socks5_dst_eventcb(struct bufferevent *bev, short what, void *arg)
 {
+	struct socks5_conn *sconn = (struct socks5_conn*)arg;
+
+	if (!sconn || !bev) {
+		oddsock_logx(0, "socks5_dst_eventcb invalid args");
+		return;
+	}
+
+	if (what & BEV_EVENT_CONNECTED) {
+		if (socks5_connect_reply(sconn) < 0) {
+			oddsock_logx(1, "(%d) failed sending request reply",
+					socks5_conn_id(sconn));
+			socks5_conn_free(sconn);
+			return;
+		}
+		oddsock_logx(1, "(%d) CONNECT succeeded", socks5_conn_id(sconn));
+		return;
+	}
+	if (what & BEV_EVENT_EOF) {
+		/* Destination closed the connection. */
+		oddsock_logx(1, "(%d) destination closed connection",
+				socks5_conn_id(sconn));
+		socks5_conn_free(sconn);
+		return;
+	}
+	if (what & BEV_EVENT_ERROR) {
+		int e = bufferevent_socket_get_dns_error(bev);
+		if (e != 0)
+			oddsock_logx(1, "DNS error: %s", gai_strerror(e));
+		else
+			oddsock_log(1, errno, "destination connection error");
+		socks5_conn_free(sconn);
+		return;
+	}
 }
 
