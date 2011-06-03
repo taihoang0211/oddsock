@@ -66,12 +66,28 @@ void print_usage()
 }
 
 /*
+ * Libevent logging
+ */
+void libevent_logcb(int severity, const char *msg)
+{
+	if (severity < _EVENT_LOG_ERR && g_opts.verbosity < 1)
+		return;
+
+	oddsock_logx(1, "libevent(%d): %s", severity, msg);
+}
+
+void libevent_fatalcb(int err)
+{
+	oddsock_error(EXIT_FAILURE, 0, "libevent fatal error %d", err);
+}
+
+/*
  * main
  */
 int main(int argc, char* argv[])
 {
-	int opt;
-	const char *shortopts = "46v";
+	int opt, e;
+	const char *shortopts = "46vb:p:";
 	struct option longopts[] = {
 		{ "listenAddress",	required_argument,	NULL,	'b'	},
 		{ "listenPort",		required_argument,	NULL,	'p'	},
@@ -130,6 +146,12 @@ int main(int argc, char* argv[])
 	 * Set up libevent.
 	 */
 
+	event_set_fatal_callback(libevent_fatalcb);
+	event_set_log_callback(libevent_logcb);
+#ifdef DEBUG
+	event_enable_debug_mode();
+#endif
+
 	base = event_base_new();
 	if (!base) {
 		oddsock_error(EXIT_FAILURE, 0, "failed to create event_base");
@@ -171,7 +193,11 @@ int main(int argc, char* argv[])
 		}
 	}
 
-	event_base_dispatch(base);
+	e = event_base_dispatch(base);
+	if (e != 0)
+		oddsock_logx(1, "event_base_dispatch returned %d", e);
+
+	oddsock_logx(1, "cleanup");
 
 	/* cleanup */
 	if (listener4_event) {

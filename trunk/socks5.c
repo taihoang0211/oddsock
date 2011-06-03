@@ -194,7 +194,6 @@ void socks5_listener_accept(int listener, short what, void *arg)
 
 	bufferevent_setcb(sconn->client, socks5_client_readcb, NULL,
 			socks5_client_eventcb, (void*)sconn);
-
 	/* Set a read timeout so that clients that connect but don't send
 	 * anything are disconnected. */
 	tv.tv_sec = 5; /* 5 second timeout OPTION */
@@ -459,14 +458,6 @@ int socks5_process_request(struct socks5_conn *sconn)
 		bufferevent_setcb(sconn->dst, socks5_dst_readcb, NULL,
 				socks5_dst_eventcb, (void*)sconn);
 
-		if (bufferevent_enable(sconn->dst, EV_READ|EV_WRITE) != 0) {
-			oddsock_logx(1, "(%d) failed to enable read/write on dst",
-					socks5_conn_id(sconn));
-			request_reply[1] = SOCKS5_REP_GENERAL_FAILURE;
-			bufferevent_write(sconn->client, request_reply, 2);
-			return -1;
-		}
-
 		/* Make sure the DNS resolver is ready. */
 		if (!g_dns_base) {
 			g_dns_base = evdns_base_new(
@@ -551,6 +542,12 @@ int socks5_connect_reply(struct socks5_conn *sconn)
 
 	sconn->status = SCONN_CONNECT_TRANSMITTING;
 
+	if (bufferevent_enable(sconn->dst, EV_READ|EV_WRITE) != 0) {
+		oddsock_logx(1, "(%d) failed to enable read/write on dst",
+				socks5_conn_id(sconn));
+		return -1;
+	}
+
 	return 0;
 }
 
@@ -568,6 +565,8 @@ void socks5_client_readcb(struct bufferevent *bev, void *arg)
 	}
 
 	if (sconn->status == SCONN_INIT) {
+		bufferevent_set_timeouts(sconn->client, NULL, NULL);
+
 		e = socks5_process_greeting(sconn);
 		if (e < 0) {
 			oddsock_logx(1, "(%d) error processing client greeting",
@@ -614,6 +613,11 @@ void socks5_client_eventcb(struct bufferevent *bev, short what, void *arg)
 		return;
 	}
 
+	if (what & BEV_EVENT_TIMEOUT) {
+		oddsock_logx(1, "(%d) client timeout", socks5_conn_id(sconn));
+		socks5_conn_free(sconn);
+		return;
+	}
 	if (what & BEV_EVENT_EOF) {
 		/* Client closed the connection. */
 		oddsock_logx(1, "(%d) client closed connection",
@@ -622,7 +626,8 @@ void socks5_client_eventcb(struct bufferevent *bev, short what, void *arg)
 		return;
 	}
 	if (what & BEV_EVENT_ERROR) {
-		oddsock_log(1, errno, "client connection error");
+		oddsock_log(1, errno, "(%d) client connection error",
+				socks5_conn_id(sconn));
 		socks5_conn_free(sconn);
 		return;
 	}
@@ -678,9 +683,11 @@ void socks5_dst_eventcb(struct bufferevent *bev, short what, void *arg)
 	if (what & BEV_EVENT_ERROR) {
 		int e = bufferevent_socket_get_dns_error(bev);
 		if (e != 0)
-			oddsock_logx(1, "DNS error: %s", gai_strerror(e));
+			oddsock_logx(1, "(%d) DNS error: %s",
+					socks5_conn_id(sconn), gai_strerror(e));
 		else
-			oddsock_log(1, errno, "destination connection error");
+			oddsock_log(1, errno, "(%d) destination connection error",
+					socks5_conn_id(sconn));
 		socks5_conn_free(sconn);
 		return;
 	}
